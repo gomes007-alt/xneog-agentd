@@ -1252,7 +1252,7 @@ function createSession({ cwd, title, model, permissionMode, engine }){
     const S = { id, engine: "api", child: null, cwd: dir2, title: (title || "api").slice(0, 60), status: "idle",
                 events: [], subs: new Set(), turns: 0, lastTs: Date.now(), createdAt: Date.now(), always: new Set(),
                 model: typeof model === "string" ? model.slice(0, 60) : "",
-                permissionMode: permissionMode === "acceptEdits" ? "acceptEdits" : "default",
+                permissionMode: (permissionMode === "acceptEdits" || permissionMode === "auto") ? permissionMode : "default",
                 archived: false, claudeSession: "", grokSession: "", lastPrompt: "", lastTurnEndTs: 0, queue: [], seq: 0, apiMessages: null };
     sessions.set(id, S);
     audit({ act: "create", id, engine: "api", cwd: dir2 });
@@ -1261,7 +1261,7 @@ function createSession({ cwd, title, model, permissionMode, engine }){
     return S;
   }
   const dir = cwd && existsSync(cwd) ? cwd : `${HOME}/Projects`;
-  const S = { id, child: null, cwd: dir, title: (title || dir.split("/").pop() || "sessão").slice(0, 60), status: "idle", events: [], subs: new Set(), turns: 0, lastTs: Date.now(), createdAt: Date.now(), always: new Set(), model: MODELS.has(model) ? model : "", permissionMode: MODES.has(permissionMode) ? permissionMode : "default", archived: false, claudeSession: "", lastPrompt: "", lastTurnEndTs: 0, queue: [], seq: 0 };
+  const S = { id, child: null, cwd: dir, title: (title || dir.split("/").pop() || "sessão").slice(0, 60), status: "idle", events: [], subs: new Set(), turns: 0, lastTs: Date.now(), createdAt: Date.now(), always: new Set(), model: MODELS.has(model) ? model : "", permissionMode: permissionMode === "auto" ? "auto" : (MODES.has(permissionMode) ? permissionMode : "default"), archived: false, claudeSession: "", lastPrompt: "", lastTurnEndTs: 0, queue: [], seq: 0 };
   wireChild(S, baseArgs(S));
   sessions.set(id, S);
   audit({ act: "create", id, cwd: dir });
@@ -1367,10 +1367,55 @@ function wireChild(S, args){
   child.on("exit", (code) => { if (S.child === child) { S.status = "dead"; S.child = null; clearQueue(S, "session_end"); denyPending(S, "session_end"); push(S, { kind: "session_end", code }); log(`[${S.id}] exit ${code}`); saveSessions(); } });
 }
 
+// ── pairing (F6): `xneog pair` gera código de uso único; o app troca o código por
+// {deviceId, secret} e passa a cunhar tokens v2 sozinho. O código É a credencial do claim:
+// 10 chars base32 (~50 bits), 5min, single-use, 10 tentativas erradas → pending morre.
+const pairPending = new Map();   // code -> { deviceId, secret, name, exp, attempts }
+function pairGC(){ const now = Date.now(); for (const [c, p] of pairPending) if (p.exp < now) pairPending.delete(c); }
+
 const server = createServer(async (req, res) => {
+  const urlEarly = new URL(req.url, "http://x");
+
+  // SEM auth: o device ainda não tem credencial — o código de pairing é a credencial.
+  if (urlEarly.pathname === "/pair/claim" && req.method === "POST") {
+    pairGC();
+    const body = JSON.parse((await readBody(req, 4096)) || "{}");
+    const code = String(body.code || "").toUpperCase().replace(/[^A-Z2-9]/g, "");
+    const P = pairPending.get(code);
+    if (!P) {
+      // tentativa errada queima TODAS as pendentes após 10 erros acumulados (anti brute-force)
+      for (const p of pairPending.values()) if (++p.attempts >= 10) { pairPending.clear(); break; }
+      res.writeHead(404, JSONH); return res.end(`{"error":"código inválido ou expirado"}`);
+    }
+    pairPending.delete(code);   // single-use
+    const map = devices();
+    map[P.deviceId] = { secret: P.secret, name: String(body.name || P.name || "device").slice(0, 60), created: new Date().toISOString() };
+    writeFileSync(DEVICES_FILE, JSON.stringify(map, null, 2) + "\n", { mode: 0o600 });
+    _devCache = { mtime: 0, map: {} };   // invalida cache (mtime pode colidir no mesmo ms)
+    log(`[pair] device ${P.deviceId} pareado (${map[P.deviceId].name})`);
+    res.writeHead(200, JSONH);
+    return res.end(JSON.stringify({ deviceId: P.deviceId, secret: P.secret, tokenFormat: "v2.<deviceId>.<expiryMs>.<hmacHex>", maxTtlMs: MAX_TTL_MS }));
+  }
+
   if (!auth(req)) { res.writeHead(401, JSONH); return res.end(`{"error":"unauthorized"}`); }
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);   // ["sessions", id?, action?]
+
+  // início do pairing: SÓ com a master key (device não cunha device)
+  if (url.pathname === "/pair/start" && req.method === "POST") {
+    const tok = (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
+    if (!eq(tok, KEY)) { res.writeHead(403, JSONH); return res.end(`{"error":"pairing exige a master key"}`); }
+    pairGC();
+    if (pairPending.size >= 5) { res.writeHead(429, JSONH); return res.end(`{"error":"pareamentos pendentes demais"}`); }
+    const body = JSON.parse((await readBody(req, 4096)) || "{}");
+    const ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";   // sem 0/O/1/I/L
+    const code = [...randomBytes(10)].map(b => ALPHA[b % ALPHA.length]).join("");
+    const P = { deviceId: `dev-${randomBytes(6).toString("hex")}`, secret: randomBytes(32).toString("hex"),
+                name: String(body.name || "").slice(0, 60), exp: Date.now() + 5 * 60 * 1000, attempts: 0 };
+    pairPending.set(code, P);
+    res.writeHead(200, JSONH);
+    return res.end(JSON.stringify({ code, deviceId: P.deviceId, expiresInSec: 300 }));
+  }
 
   // SSE global: "a lista mudou". Heartbeat mantém o túnel do cloudflared vivo.
   if (url.pathname === "/events" && req.method === "GET") {
@@ -1398,7 +1443,7 @@ const server = createServer(async (req, res) => {
   if (url.pathname === "/meta" && req.method === "GET") {
     res.writeHead(200, JSONH);
     return res.end(JSON.stringify({ name: "xneog-agentd", protocol: 1,
-      capabilities: ["sessions", "cli", "tasks", "commands", "approval-queue", "sse-replay", "inject-tty", "queue", "revive", "adopt", "engines", "transcripts", "import"] }));
+      capabilities: ["sessions", "cli", "tasks", "commands", "approval-queue", "sse-replay", "inject-tty", "queue", "revive", "adopt", "engines", "transcripts", "import", "pair"] }));
   }
 
   // F2: registry declarativo de engines/modelos (builtin + overlay engines.json, editável sem deploy)
@@ -1755,7 +1800,7 @@ const server = createServer(async (req, res) => {
     let b; try { b = JSON.parse((await readBody(req)) || "{}"); } catch { b = {}; }
     const m = typeof b.mode === "string" ? b.mode : "";
     if (S.engine === "api") {   // F4: sem processo → sem respawn; plan não existe no loop próprio
-      if (m !== "default" && m !== "acceptEdits") { res.writeHead(400, JSONH); return res.end(`{"error":"engine api aceita default|acceptEdits"}`); }
+      if (m !== "default" && m !== "acceptEdits" && m !== "auto") { res.writeHead(400, JSONH); return res.end(`{"error":"engine api aceita default|acceptEdits|auto"}`); }
       S.permissionMode = m;
       audit({ act: "mode", id: S.id, engine: "api", mode: m });
       push(S, { kind: "mode_changed", mode: m }); saveSessions();

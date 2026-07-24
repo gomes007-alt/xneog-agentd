@@ -31,7 +31,7 @@ Sessão = processo dirigível no Mac. Duas classes (`engine`):
 
 | engine   | processo                                     | modos | aprovação | resume |
 |----------|----------------------------------------------|-------|-----------|--------|
-| `claude` | `claude -p` stream-json persistente (1/sessão) | default/acceptEdits/plan | fila do daemon | `--resume <claudeSession>` |
+| `claude` | `claude -p` stream-json persistente (1/sessão) | default/acceptEdits/plan/**auto** | fila do daemon | `--resume <claudeSession>` |
 | `grok`   | 1 spawn POR TURNO sob Seatbelt (`grok-jail.sb`), cwd presa em `~/GrokWork/<id>` | NÃO (400) — a jaula é a parede | `--always-approve` | `-r <grokSession>` |
 | `api`    | NENHUM — loop agentic do próprio daemon (F4): Messages API via chat-api, ≤20 iterações/turno | default/acceptEdits (plan → 400) | mesma fila do daemon (Bash/Write) | `transcripts/<id>.messages.json` |
 
@@ -118,7 +118,10 @@ deltas (o `text` consolidado cobre).
 3. Lote: `POST /sessions/:id/permission/bulk` `{ approve, always }` — resolve pendentes
    de escrita e semeia a família (Edit/Write/MultiEdit…).
 4. Sem resposta em 120s = negado. `session_end` nega tudo pendente.
-5. `bypassPermissions` NÃO existe de propósito.
+5. `bypassPermissions` do CLI NÃO é exposto. O modo **`auto`** (opt-in POR SESSÃO, 24-jul)
+   é diferente: a fila continua no daemon, que aprova na hora COM trilha de auditoria
+   (`by:"auto"` no audit.jsonl) — revogável a quente via `POST /mode`. Engines claude e api;
+   grok segue sem modos (jaula).
 
 ## 7. Fila de turnos
 
