@@ -22,6 +22,10 @@ assumir sem ler o daemon.
 - HTTP/1.1 em `127.0.0.1:8802` (bind local; o device chega via proxy `/code/*` do BFF).
 - Auth: `Authorization: Bearer <NATIVE_API_KEY>` OU token por-device
   `v2.<deviceId>.<expiry>.<hmac>` (TTL 10min, emitido pelo BFF — só p/ `/code/*`).
+- Pairing (capability `pair`): `xneog pair` → `POST /pair/start` (master key) gera código
+  single-use de 5min; o device troca via `POST /pair/claim` (sem auth — o código é a
+  credencial) por `{ deviceId, secret }` e passa a cunhar tokens v2 localmente
+  (`hmac = HMAC-SHA256(secret, "deviceId.expiry")`). 10 claims errados → pendências limpas.
 - Respostas JSON `{...}` ou erro `{ "error": "..." }` com status HTTP correspondente.
 - SSE: `text/event-stream`, frames `data: {...}\n\n`, heartbeat `: hb` a cada 15s.
 
@@ -213,6 +217,8 @@ POST /sessions/cli/:pid/interrupt       SIGINT no processo do CLI
 POST /sessions/cli/:pid/adopt           adota sessão do CLI (vira dirigível)
 POST /sessions/cli/:pid/inject          injeta texto no tty (gate: pid+start-time)
 POST /internal/approval                 (interno) MCP de aprovação → daemon
+POST /pair/start                        { name? } → { code, deviceId, expiresInSec } (só master key)
+POST /pair/claim                        SEM auth: { code, name? } → { deviceId, secret, tokenFormat, maxTtlMs }
 ```
 
 ## 12. Regras de compatibilidade para clientes

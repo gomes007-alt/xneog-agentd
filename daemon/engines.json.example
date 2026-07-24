@@ -1,0 +1,14 @@
+{
+  "_": "Overlay declarativo do registry de engines (GET /models). Copie para engines.json e edite — merge por chave sobre os builtins (claude, grok, api); sem deploy, o daemon relê por mtime.",
+  "claude": {
+    "notes": "engine first-party — usa o Claude Code logado do próprio usuário (plano dele)"
+  },
+  "grok": {
+    "label": "Grok (jaula Seatbelt)",
+    "notes": "só enxerga ~/GrokWork/<sessão>; a parede é a jaula, não a fila"
+  },
+  "api": {
+    "models": ["sonnet", "haiku", "opus", "fable"],
+    "notes": "loop agentic metered via chat-api — a API key nunca chega ao daemon"
+  }
+}
