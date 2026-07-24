@@ -1,0 +1,26 @@
+;; grok-jail.sb — jaula Seatbelt para sessões GROK do xneog-agentd (F2, 24-jul-2026).
+;;
+;; Ameaça (provada, cereblab jul-2026): o CLI grok exfiltrou repos inteiros. Logo a parede é de
+;; LEITURA: o processo não enxerga NADA de /Users/erck além da jail (~/GrokWork/<sessão>) e do
+;; próprio estado (~/.grok — auth/config/sessões). Mesmo que suba "tudo", tudo = a jail.
+;; Estratégia: allow default no SISTEMA (deny-default aborta o binário Rust — dyld/cryptexes),
+;; deny em /Users/erck e /Volumes, allow de volta só jail + ~/.grok. Em Seatbelt a última regra
+;; que casa VENCE — a ordem abaixo é intencional. Filhos (shell de tools) herdam o perfil.
+;; Defesa em profundidade: este perfil + cwd na jail + --sandbox interno do grok.
+;; Uso: sandbox-exec -D JAIL=<dir> -f grok-jail.sb ~/.grok/bin/grok ...
+(version 1)
+(allow default)
+
+;; nada do usuário (repos, memória, iCloud, Documents, .ssh, .claude…) nem discos externos
+(deny file-read* file-write*
+  (subpath "/Users/erck")
+  (subpath "/Volumes"))
+
+;; …exceto o mundo permitido do engine
+(allow file-read* file-write*
+  (subpath (param "JAIL"))
+  (subpath "/Users/erck/.grok")
+  (subpath "/Users/erck/GrokWork"))
+
+;; stat/realpath ao resolver caminhos (sem conteúdo) — o grok resolve $HOME no boot
+(allow file-read-metadata (subpath "/Users/erck"))
