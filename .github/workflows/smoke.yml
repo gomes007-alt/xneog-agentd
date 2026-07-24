@@ -1,0 +1,11 @@
+name: smoke
+on: [push, pull_request]
+jobs:
+  contract-v1:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: node --check daemon/xneog-code-bridge.mjs && node --check bin/xneog-agentd.mjs
+      - run: ./test/smoke.sh
