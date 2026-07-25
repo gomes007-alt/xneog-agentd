@@ -63,7 +63,7 @@ if (cmd === "init") {
     writeFileSync(ENVF, (existsSync(ENVF) ? readFileSync(ENVF, "utf8").replace(/\n?$/, "\n") : "") + `NATIVE_API_KEY=${key}\n`, { mode: 0o600 });
     console.log(`✓ NATIVE_API_KEY gerada em ${ENVF} (0600)`);
   } else console.log(`✓ NATIVE_API_KEY já existe em ${ENVF}`);
-  for (const f of ["grok-jail.sb"]) {
+  for (const f of ["grok-jail.sb", "mcp-approval.mjs"]) {
     const dst = join(ADIR, f);
     if (!existsSync(dst)) copyFileSync(join(PKG, "daemon", f), dst);
   }
