@@ -1,6 +1,6 @@
 {
   "name": "@xneog/agentd",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "xneog-agentd — daemon self-host de sessões agentic (Claude Code envelopado com fila de aprovação fail-closed; protocolo v1)",
   "type": "module",
   "bin": {

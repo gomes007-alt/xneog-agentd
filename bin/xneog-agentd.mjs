@@ -38,10 +38,12 @@ function loadEnv(p) {
 }
 
 function findClaude() {
-  for (const p of [`${HOME}/.local/bin/claude`, "/usr/local/bin/claude", "/opt/homebrew/bin/claude"]) {
-    if (existsSync(p)) return p;
-  }
-  try { return execFileSync("/usr/bin/which", ["claude"], { encoding: "utf8" }).trim() || null; }
+  const cands = process.platform === "win32"
+    ? [`${HOME}\\.local\\bin\\claude.exe`, `${process.env.APPDATA || HOME + "\\AppData\\Roaming"}\\npm\\claude.cmd`]
+    : [`${HOME}/.local/bin/claude`, "/usr/local/bin/claude", "/opt/homebrew/bin/claude"];
+  for (const p of cands) if (existsSync(p)) return p;
+  const which = process.platform === "win32" ? ["where", ["claude"]] : ["/usr/bin/which", ["claude"]];
+  try { return execFileSync(which[0], which[1], { encoding: "utf8" }).split(/\r?\n/)[0].trim() || null; }
   catch { return null; }
 }
 

@@ -121,6 +121,10 @@ deltas (o `text` consolidado cobre).
    entram no always (nem por lote) — a razão da ponte existir é a fila segurar Bash.
 3. Lote: `POST /sessions/:id/permission/bulk` `{ approve, always }` — resolve pendentes
    de escrita e semeia a família (Edit/Write/MultiEdit…).
+3b. Em `acceptEdits`, Bash de **leitura pura** também passa sozinho (`by:"auto-read"` no audit,
+   com o comando registrado): allowlist estrita de verbos (ls/cat/grep/find/git log…), pipes e
+   `;`/`&&` só entre verbos permitidos, `>/dev/null` tolerado. Redirecionamento real, subshell
+   `$(…)`, background, sudo/eval/xargs, flag destrutiva ou verbo desconhecido → cai na fila.
 4. Sem resposta em 120s = negado. `session_end` nega tudo pendente.
 5. `bypassPermissions` do CLI NÃO é exposto. O modo **`auto`** (opt-in POR SESSÃO, 24-jul)
    é diferente: a fila continua no daemon, que aprova na hora COM trilha de auditoria

@@ -40,8 +40,10 @@ if (!KEY) { console.error("FATAL: NATIVE_API_KEY ausente no .env"); process.exit
 process.on("uncaughtException", (e) => { try { log(`UNCAUGHT: ${String(e?.stack || e).slice(0, 300)}`); } catch {} });
 process.on("unhandledRejection", (e) => { try { log(`UNHANDLED: ${String(e?.stack || e).slice(0, 300)}`); } catch {} });
 
+const WIN = process.platform === "win32";
 const CLAUDE = process.env.XNEOG_CLAUDE_BIN || `${HOME}/.local/bin/claude`;
-const PATHENV = `${HOME}/.local/bin:${HOME}/.local/node/bin:${process.env.PATH || ""}:/usr/bin:/bin`;
+const PATHENV = WIN ? (process.env.PATH || "")
+  : `${HOME}/.local/bin:${HOME}/.local/node/bin:${process.env.PATH || ""}:/usr/bin:/bin`;
 // F4: loop agentic próprio via chat-api (:3848) — a ANTHROPIC_API_KEY vive SÓ lá; o bridge fala
 // com o passthrough /v1/agent/messages usando um service key compartilhado (metering central).
 const CHAT_API = env.CHAT_API_BASE || "http://127.0.0.1:3848";
@@ -62,7 +64,7 @@ const APPROVAL_SECRET = randomBytes(24).toString("hex");
 function writeMcpConfig(id){
   const p = `${CFGDIR}/${id}.json`;
   writeFileSync(p, JSON.stringify({ mcpServers: { approver: {
-    command: `${HOME}/.local/node/bin/node`,
+    command: process.execPath,
     args: [`${DIR}/mcp-approval.mjs`],
     env: { BRIDGE_SESSION: id, BRIDGE_PORT: String(PORT), BRIDGE_KEY: KEY, APPROVAL_SECRET },
   } } }), { mode: 0o600 });
@@ -76,6 +78,33 @@ let transcriptStreams = 0;
 const MAX_SESSIONS = 6;
 const MAX_EVENTS = 4000;          // buffer de replay por sessão
 const TOOL_RESULT_CAP = 4000;     // trunca payloads gigantes pro app
+
+// Serialização do input de tool PRESERVANDO O JSON VÁLIDO. Antes: JSON.stringify(...).slice(cap) —
+// um Write de 10KB virava JSON cortado no meio, o app não conseguia parsear e o cartão de aprovação
+// perdia diff, caminho do arquivo e virava um blob ilegível. Justo no cartão onde o dono decide.
+// Agora corta o VALOR de cada campo longo (marcando o corte) e mantém a estrutura intacta.
+function capInput(obj, cap = TOOL_RESULT_CAP){
+  try {
+    if (!obj || typeof obj !== "object") return JSON.stringify(obj ?? {});
+    const campos = Object.keys(obj).length || 1;
+    const porCampo = Math.max(400, Math.floor(cap / campos));
+    const out = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === "string" && v.length > porCampo) out[k] = v.slice(0, porCampo) + `\n… [+${v.length - porCampo} chars]`;
+      else if (Array.isArray(v)) out[k] = v.slice(0, 20).map(x => {   // ex.: edits[] do MultiEdit
+        if (x && typeof x === "object") {
+          const o2 = {};
+          for (const [k2, v2] of Object.entries(x)) o2[k2] = (typeof v2 === "string" && v2.length > porCampo) ? v2.slice(0, porCampo) + `\n… [+${v2.length - porCampo} chars]` : v2;
+          return o2;
+        }
+        return (typeof x === "string" && x.length > porCampo) ? x.slice(0, porCampo) + "…" : x;
+      });
+      else out[k] = v;
+    }
+    const s = JSON.stringify(out);
+    return s.length > cap * 2 ? s.slice(0, cap * 2) : s;   // rede de segurança, raríssimo
+  } catch { return JSON.stringify({ erro: "input não serializável" }); }
+}
 
 const sessions = new Map();       // id → S
 const pending = new Map();        // requestId → {res, sid, tool, timer}  (aprovações aguardando o owner)
@@ -259,6 +288,7 @@ function interruptTty(tty){
 // sentidos (ver injectToSocket). O PTY socket aceita input sem auth OAuth (auth é do control socket).
 function sockForJob(jobId){
   if (!jobId || !/^[a-f0-9]{6,40}$/i.test(jobId)) return null;
+  if (!process.getuid) return null; // win32: sem PTY socket Unix — injeção indisponível
   const base = `/tmp/cc-daemon-${process.getuid()}`;
   let dirs = []; try { dirs = readdirSync(base); } catch { return null; }
   for (const d of dirs) { const p = `${base}/${d}/pty/${jobId}.sock`; if (existsSync(p)) return p; }
@@ -639,15 +669,18 @@ function cliSessions(){
 }
 
 // push curado → feed Atualizações do app (que já notifica briefs novos) · throttle por sessão+tipo
-function notify(S, type, title, summary, body){
+function notify(S, type, title, summary, body, extra = {}){
   const now = Date.now();
   S.lastNotify = S.lastNotify || {};
-  if (now - (S.lastNotify[type] || 0) < 30000) return;   // 1/30s por tipo
+  // APROVAÇÃO NUNCA É ENGOLIDA: o throttle de 30s/tipo existe pra não spammar "done", mas dois pedidos
+  // seguidos são o caso NORMAL de um turno — o 2º sumia e morria no timeout de 120s sem ninguém ver.
+  if (type !== "approval" && now - (S.lastNotify[type] || 0) < 30000) return;
   S.lastNotify[type] = now;
   fetch("http://127.0.0.1:8801/brief", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${KEY}` },
-    body: JSON.stringify({ title, summary, body, silent: false }),
+    // sid/requestId viajam junto: sem eles a notificação não tinha como abrir A sessão certa
+    body: JSON.stringify({ title, summary, body, silent: false, sid: S.id, kind: type, ...extra }),
     signal: AbortSignal.timeout(3000),   // BFF pendurado não acumula socket/promise por 5min (default undici)
   }).catch(() => {});
 }
@@ -781,6 +814,53 @@ const itemBytes = it => (it.content || []).reduce((n, c) => n + (c.source?.data?
 const EDIT_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 // Nunca entram no allowlist "always" (nem por lote): a razão da ponte existir é a fila segurar Bash & cia.
 const NEVER_ALWAYS = new Set(["Bash", "KillShell", "KillBash", "BashOutput"]);
+
+// ── Bash de LEITURA (24-jul, decisão baseada em dados) ───────────────────────
+// Telemetria de 121 aprovações reais: 87 eram Bash e 53% delas pura inspeção (grep/ls/cat/wc/head),
+// com 2,5% de negativas e mediana de 4s de espera — a fila cobrava pedágio em quem só olhava.
+// No modo acceptEdits (que JÁ auto-aprova escrita de arquivo) leitura passar é mais coerente, não
+// menos seguro. Allowlist ESTRITA: verbo desconhecido, redirecionamento, subshell, background,
+// sudo/eval/xargs ou flag destrutiva → cai na fila como antes. Auditado como by:"auto-read".
+const READ_VERBS = new Set(["ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "stat", "file",
+  "du", "df", "pwd", "echo", "which", "type", "date", "uname", "hostname", "whoami", "ps", "lsof",
+  "sort", "uniq", "cut", "basename", "dirname", "realpath", "printenv", "tree", "column", "diff",
+  "cmp", "shasum", "md5", "jq", "sips", "plutil", "defaults"]);
+const GIT_READ = new Set(["status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "describe"]);
+function isReadOnlyBash(cmd){
+  const s = String(cmd || "").trim();
+  if (!s || s.length > 400) return false;
+  const t = s
+    .replace(/\s*&>\s*\/dev\/null/g, "")            // descartar saída não é escrever em lugar nenhum
+    .replace(/\s*\d?>\s*\/dev\/null/g, "")
+    .replace(/\s*2>&1/g, "")
+    .replace(/&&/g, ";");                           // encadeamento sequencial é ok; background não
+  if (/&/.test(t)) return false;                    // `cmd &` roda solto, fora do timeout
+  if (/[>`]|\$\(|<\(/.test(t)) return false;        // redireciona (escreve) ou executa em subshell
+  if (/\b(sudo|eval|exec|xargs|source)\b/.test(t)) return false;
+  const segs = t.split(/[;|]/).map(x => x.trim()).filter(Boolean);
+  if (!segs.length || segs.length > 6) return false;
+  for (const seg of segs) {
+    const parts = seg.split(/\s+/);
+    const verb = (parts[0] || "").split("/").pop();
+    if (verb === "cd") continue;                    // prefixo comum: `cd dir; ls`
+    if (verb === "git") {                           // `git -C <path> log` é o formato real do dia a dia
+      const args = parts.slice(1);
+      let i = 0;
+      while (i < args.length && args[i].startsWith("-")) i += (args[i] === "-C" || args[i] === "-c") ? 2 : 1;
+      if (!GIT_READ.has(args[i])) return false;
+      continue;
+    }
+    if (!READ_VERBS.has(verb)) return false;
+    if (verb === "find" && /\s-(delete|exec|execdir|ok|okdir)\b/.test(seg)) return false;
+    if (verb === "defaults" && !/\s(read|read-type|domains|find)\b/.test(seg)) return false;
+    if (verb === "plutil" && !/\s-(p|lint|convert)\b/.test(seg)) return false;
+  }
+  return true;
+}
+// leitura auto-aprovada SÓ em acceptEdits (opt-in explícito do dono); default segue pedindo tudo
+function autoReadOK(S, tool, input){
+  return S.permissionMode === "acceptEdits" && tool === "Bash" && isReadOnlyBash(input?.command);
+}
 
 // ── FILA DE MENSAGENS (serialização obrigatória) ─────────────────────────────
 // Verificado 09-jul: escrever um `user` no stdin do claude DURANTE um turno **aborta o turno**.
@@ -987,7 +1067,7 @@ function engineRegistry(){
   const builtin = {
     claude: { label: "Claude Code", models: [...MODELS], trusted: true, default: true },
     grok:   { label: "Grok (jaula)", models: ["default"], trusted: false, jail: GROK_JAIL_ROOT,
-              available: existsSync(GROK_BIN) && existsSync(GROK_SB),
+              available: process.platform === "darwin" && existsSync(GROK_BIN) && existsSync(GROK_SB),
               notes: "pesquisa/2ª opinião · enxerga SÓ ~/GrokWork/<sessão> (Seatbelt) · sem aprovação (a parede é a jaula)" },
     api:    { label: "Claude API (key)", models: ["sonnet", "haiku", "opus", "fable"], trusted: true, metered: true,
               available: !!AGENT_KEY,
@@ -1063,6 +1143,7 @@ function waitApproval(S, tool, input){
     // modo AUTO (opt-in POR SESSÃO, decisão do Gomes 24-jul): a fila não pendura — o daemon aprova
     // na hora, com trilha de auditoria. Diferente de bypass: por sessão, auditado, revogável a quente.
     if (S.permissionMode === "auto") { audit({ act: "approval", sid: S.id, tool, approved: true, by: "auto" }); return resolve({ behavior: "allow", updatedInput: input }); }
+    if (autoReadOK(S, tool, input)) { audit({ act: "approval", sid: S.id, tool, approved: true, by: "auto-read", cmd: String(input?.command || "").slice(0, 120) }); return resolve({ behavior: "allow", updatedInput: input }); }
     if (S.always.has(tool)) { audit({ act: "approval", sid: S.id, tool, approved: true, by: "always" }); return resolve({ behavior: "allow", updatedInput: input }); }
     if (pending.size >= MAX_PENDING) return resolve({ behavior: "deny", message: "fila de aprovação cheia" });
     const requestId = randomUUID();
@@ -1070,9 +1151,9 @@ function waitApproval(S, tool, input){
     pending.set(requestId, { cb: resolve, sid: S.id, tool, input, timer });
     S.laLast = 0;
     laPush(S, { fase: "aprovação", tool, requerEntrada: true });
-    push(S, { kind: "permission_request", requestId, tool, input: JSON.stringify(input ?? {}).slice(0, TOOL_RESULT_CAP) });
+    push(S, { kind: "permission_request", requestId, tool, input: capInput(input) });
     const cmd = (input && (input.command || input.file_path)) || "";
-    notify(S, "approval", `⌘ Requer aprovação · ${S.title}`, `${tool}: ${String(cmd).slice(0, 120)}`, `Sessão "${S.title}" aguardando sua decisão (${tool}). Abra Código → ${S.title}. Sem resposta em 120s = negado.`);
+    notify(S, "approval", `⌘ Requer aprovação · ${S.title}`, `${tool}: ${String(cmd).slice(0, 120)}`, `Sessão "${S.title}" aguardando sua decisão (${tool}). Abra Código → ${S.title}. Sem resposta em 120s = negado.`, { requestId, tool });
   });
 }
 
@@ -1162,7 +1243,9 @@ async function runApiTool(S, name, input){
     const d = await waitApproval(S, "Bash", { command: cmd });   // Bash NUNCA entra em always (NEVER_ALWAYS)
     if (d.behavior !== "allow") return { text: d.message || "negado", isError: true };
     return await new Promise((resolve) => {
-      const child = spawn("/bin/zsh", ["-lc", cmd], { cwd: S.cwd, env: { ...process.env, PATH: PATHENV } });
+      const child = WIN
+        ? spawn("cmd.exe", ["/d", "/s", "/c", cmd], { cwd: S.cwd, env: { ...process.env, PATH: PATHENV }, windowsVerbatimArguments: true })
+        : spawn("/bin/zsh", ["-lc", cmd], { cwd: S.cwd, env: { ...process.env, PATH: PATHENV } });
       S.apiChild = child;   // interrupt do turno mata o Bash em voo junto
       let out = "";
       const cap = (dd) => { if (out.length < 200 * 1024) out += dd; };
@@ -1205,7 +1288,7 @@ async function apiTurn(S, item){
       for (const b of j.content || []) {
         if (b.type === "text" && b.text) push(S, { kind: "text", text: b.text });
         else if (b.type === "tool_use") {
-          push(S, { kind: "tool_use", toolId: b.id, tool: b.name, input: JSON.stringify(b.input ?? {}).slice(0, TOOL_RESULT_CAP) });
+          push(S, { kind: "tool_use", toolId: b.id, tool: b.name, input: capInput(b.input) });
           const out = S.apiStop ? { text: "turno interrompido pelo owner", isError: true } : await runApiTool(S, b.name, b.input || {});
           push(S, { kind: "tool_result", toolId: b.id, output: String(out.text).slice(0, TOOL_RESULT_CAP), isError: !!out.isError });
           results.push({ type: "tool_result", tool_use_id: b.id, content: String(out.text).slice(0, 30000), is_error: !!out.isError });
@@ -1480,6 +1563,7 @@ const server = createServer(async (req, res) => {
     const tool = String(b.tool_name || "?");
     if (!S) { res.writeHead(200, JSONH); return res.end(JSON.stringify({ behavior: "deny", message: "sessão desconhecida" })); }
     if (S.permissionMode === "auto") { res.writeHead(200, JSONH); audit({ act: "approval", sid: S.id, tool, approved: true, by: "auto" }); return res.end(JSON.stringify({ behavior: "allow", updatedInput: b.input ?? {} })); }
+    if (autoReadOK(S, tool, b.input)) { res.writeHead(200, JSONH); audit({ act: "approval", sid: S.id, tool, approved: true, by: "auto-read", cmd: String(b.input?.command || "").slice(0, 120) }); return res.end(JSON.stringify({ behavior: "allow", updatedInput: b.input ?? {} })); }
     if (S.always.has(tool)) { res.writeHead(200, JSONH); audit({ act: "approval", sid: S.id, tool, approved: true, by: "always" }); return res.end(JSON.stringify({ behavior: "allow", updatedInput: b.input ?? {} })); }
     // teto de pendentes: fail-closed (nega, não acumula) — cada pendente segura um socket + timer 120s
     if (pending.size >= MAX_PENDING) { res.writeHead(200, JSONH); return res.end(JSON.stringify({ behavior: "deny", message: "fila de aprovação cheia" })); }
@@ -1488,9 +1572,9 @@ const server = createServer(async (req, res) => {
     pending.set(requestId, { res, sid: S.id, tool, input: b.input ?? {}, timer });
     S.laLast = 0;   // zera ANTES: aprovação é raro e importante, o throttle não pode engolir
     laPush(S, { fase: "aprovação", tool, requerEntrada: true });
-    push(S, { kind: "permission_request", requestId, tool, input: JSON.stringify(b.input ?? {}).slice(0, TOOL_RESULT_CAP) });
+    push(S, { kind: "permission_request", requestId, tool, input: capInput(b.input) });
     const cmd = (b.input && (b.input.command || b.input.file_path)) || "";
-    notify(S, "approval", `⌘ Requer aprovação · ${S.title}`, `${tool}: ${String(cmd).slice(0, 120)}`, `Sessão "${S.title}" aguardando sua decisão (${tool}). Abra Código → ${S.title}. Sem resposta em 120s = negado.`);
+    notify(S, "approval", `⌘ Requer aprovação · ${S.title}`, `${tool}: ${String(cmd).slice(0, 120)}`, `Sessão "${S.title}" aguardando sua decisão (${tool}). Abra Código → ${S.title}. Sem resposta em 120s = negado.`, { requestId, tool });
     return;   // resposta fica pendurada até resolveApproval
   }
 
