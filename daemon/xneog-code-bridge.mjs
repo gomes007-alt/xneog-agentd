@@ -1457,6 +1457,8 @@ const pairPending = new Map();   // code -> { deviceId, secret, name, exp, attem
 function pairGC(){ const now = Date.now(); for (const [c, p] of pairPending) if (p.exp < now) pairPending.delete(c); }
 
 const server = createServer(async (req, res) => {
+  // alias /code/* → /* : o app iOS fala o contrato do proxy do native-api; aqui é o mesmo protocolo
+  if (req.url.startsWith("/code/")) req.url = req.url.slice(5);
   const urlEarly = new URL(req.url, "http://x");
 
   // SEM auth: o device ainda não tem credencial — o código de pairing é a credencial.
