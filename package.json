@@ -3,9 +3,16 @@
   "version": "0.1.0",
   "description": "xneog-agentd — daemon self-host de sessões agentic (Claude Code envelopado com fila de aprovação fail-closed; protocolo v1)",
   "type": "module",
-  "bin": { "xneog-agentd": "./bin/xneog-agentd.mjs" },
-  "files": ["bin/", "daemon/"],
-  "engines": { "node": ">=20" },
+  "bin": {
+    "xneog-agentd": "bin/xneog-agentd.mjs"
+  },
+  "files": [
+    "bin/",
+    "daemon/"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "license": "MIT",
   "author": "xNeog"
 }
