@@ -1938,6 +1938,19 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, JSONH); return res.end(`{"ok":true}`);
   }
 
+  // Último texto do assistente desta sessão. Existe pro BFF montar o retorno de um despacho do Vox
+  // ("o agente terminou, ele disse X") sem abrir um SSE e replayar a sessão inteira só pra ler o fim.
+  if (parts[2] === "last" && req.method === "GET") {
+    const evs = S.events.length ? S.events : transRead(S.id, 0, 400);
+    let text = "";
+    for (let i = evs.length - 1; i >= 0; i--) {
+      const e = evs[i];
+      if (e.kind === "text" && typeof e.text === "string" && e.text.trim()) { text = e.text.trim(); break; }
+    }
+    res.writeHead(200, JSONH);
+    return res.end(JSON.stringify({ id: S.id, title: S.title, status: S.status, turns: S.turns, text: text.slice(0, 8000) }));
+  }
+
   if (parts[2] === "rename" && req.method === "POST") {
     let b; try { b = JSON.parse((await readBody(req)) || "{}"); } catch { b = {}; }
     const t = typeof b.title === "string" ? b.title.trim().slice(0, 60) : "";
