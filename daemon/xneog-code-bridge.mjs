@@ -78,6 +78,12 @@ let transcriptStreams = 0;
 const MAX_SESSIONS = 6;
 const MAX_EVENTS = 4000;          // buffer de replay por sessão
 const TOOL_RESULT_CAP = 4000;     // trunca payloads gigantes pro app
+// PROSA não é payload. O cap de 4000 servia pra saída de ferramenta (log de build, arquivo lido),
+// mas era aplicado também ao texto do agente: uma resposta longa chegava cortada no meio da frase,
+// SEM marcador — no app parecia que o agente tinha parado de escrever. Prosa ganha cap próprio, e
+// truncar (raro: a janela de leitura do transcript já limita o volume) passa a deixar rastro.
+const TEXT_CAP = 200_000;
+const capText = s => s.length > TEXT_CAP ? s.slice(0, TEXT_CAP) + `\n\n… [+${s.length - TEXT_CAP} caracteres truncados]` : s;
 
 // Serialização do input de tool PRESERVANDO O JSON VÁLIDO. Antes: JSON.stringify(...).slice(cap) —
 // um Write de 10KB virava JSON cortado no meio, o app não conseguia parsear e o cartão de aprovação
@@ -424,7 +430,7 @@ function curateCliLine(j, out, sink){
         const stdout = (content.match(/<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/)?.[1] || "")
           .replace(/\x1b?\[[0-9;]*m/g, "").trim();
         if (name || stdout) out.push({ kind: "command", name, output: stdout.slice(0, TOOL_RESULT_CAP) });
-      } else if (content.trim()) out.push({ kind: "user", text: content.slice(0, TOOL_RESULT_CAP) });
+      } else if (content.trim()) out.push({ kind: "user", text: capText(content) });
     } else if (Array.isArray(content)) {
       for (const b of content) {
         if (b?.type === "tool_result") {
@@ -434,14 +440,14 @@ function curateCliLine(j, out, sink){
           const run = txt.match(/Run ID: (wf_[a-z0-9-]{6,})/)?.[1];
           out.push({ kind: "tool_result", id: b.tool_use_id, output: txt.slice(0, TOOL_RESULT_CAP), isError: !!b.is_error, ...(run ? { runId: run } : {}) });
         } else if (b?.type === "text" && b.text?.trim()) {
-          out.push({ kind: "user", text: b.text.slice(0, TOOL_RESULT_CAP) });
+          out.push({ kind: "user", text: capText(b.text) });
         }
       }
     }
   } else if (t === "assistant") {
     for (const b of (j.message?.content || [])) {
-      if (b.type === "text" && b.text) out.push({ kind: "text", text: b.text.slice(0, TOOL_RESULT_CAP) });
-      else if (b.type === "thinking" && b.thinking) out.push({ kind: "thinking", text: b.thinking.slice(0, TOOL_RESULT_CAP) });
+      if (b.type === "text" && b.text) out.push({ kind: "text", text: capText(b.text) });
+      else if (b.type === "thinking" && b.thinking) out.push({ kind: "thinking", text: capText(b.thinking) });
       else if (b.type === "tool_use") {
         const inp = b.input ?? {};
         // Subagentes/workflows viram card nomeado (padrão do app oficial RC), não tool genérico.
