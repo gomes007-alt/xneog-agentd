@@ -210,6 +210,24 @@ const CLI_SESS_DIR = `${HOME}/.claude/sessions`;
 const CLI_PROJECTS = `${HOME}/.claude/projects`;
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
+// Apelidos dados pelo usuário às sessões do terminal. Overlay do BRIDGE, não do CLI: escrever no
+// ~/.claude/sessions/<pid>.json não adianta — o próprio Claude Code reescreve aquele arquivo
+// (status/updatedAt/name) e comeria o apelido. Chave = sessionId quando existe (estável entre
+// restarts do bridge), senão `pid:<pid>` (pid recicla, por isso a poda ao salvar).
+const CLI_NAMES_FILE = `${DIR}/cli-names.json`;
+const cliNameKey = j => (j.sessionId ? `sid:${j.sessionId}` : `pid:${j.pid}`);
+let cliNames = {};
+try { const o = JSON.parse(readFileSync(CLI_NAMES_FILE, "utf8")); if (o && typeof o === "object") cliNames = o; } catch {}
+function saveCliNames(){
+  // poda: apelido preso a um pid que não existe mais é lixo (o sid sobrevive, o pid não)
+  for (const k of Object.keys(cliNames)) {
+    if (k.startsWith("pid:") && !pidAlive(Number(k.slice(4)))) delete cliNames[k];
+  }
+  try { writeFileSync(CLI_NAMES_FILE, JSON.stringify(cliNames, null, 2), { mode: 0o600 }); }
+  catch (e) { log(`save cli-names err ${e.message}`); }
+}
+
+
 // Snapshot pid→{tty,startMs} de UMA chamada `ps -axo` (TTL 1s). tty e start-time são imutáveis na vida
 // do processo, então um snapshot recente serve pra todas as sessões de um request. Antes cada sessão
 // disparava 2 spawnSync (lstart + tty) por poll de /sessions/cli → 8-12 forks bloqueavam a thread única
@@ -660,7 +678,10 @@ function cliSessions(){
     const tty = valid ? sessionTty(j.pid) : null;                 // sessão interativa num terminal → TTY
     const sock = valid && !tty ? sockForJob(j.jobId) : null;      // bg job → pty.sock (input = bytes crus)
     const driveVia = tty ? "tty" : sock ? "socket" : null;        // o app decide a UI por aqui
-    out.push({ pid: j.pid, sessionId: j.sessionId || "", name: j.name || `pid ${j.pid}`, cwd: j.cwd || "",
+    // apelido do usuário ganha do nome derivado (toda sessão aberta no HOME nasce com o mesmo nome)
+    const alias = cliNames[cliNameKey(j)];
+    out.push({ pid: j.pid, sessionId: j.sessionId || "", name: alias || j.name || `pid ${j.pid}`, cwd: j.cwd || "",
+               alias: !!alias,
                kind: j.kind || "", status: displayStatus(j, alive), connected: alive,
                startedAt: j.startedAt || 0, lastTs: j.updatedAt || j.startedAt || 0,
                remote: !!j.bridgeSessionId, driveable: false, injectable: !!driveVia, driveVia });
@@ -1608,6 +1629,47 @@ const server = createServer(async (req, res) => {
   // com processos que ele mesmo spawnou em stream-json.
   if (parts[0] === "sessions" && parts[1] === "cli" && parts.length === 2 && req.method === "GET") {
     res.writeHead(200, JSONH); return res.end(JSON.stringify({ sessions: cliSessions() }));
+  }
+
+  // Elimina a sessão do terminal: encerra o processo claude (se vivo) e tira o registro da lista.
+  // SIGTERM primeiro (o CLI sai limpo e o hook SessionEnd remove o json sozinho); só recorre a
+  // SIGKILL se ainda estiver de pé em 1.5s — e aí o json é removido aqui, porque hook morto não roda.
+  // A ABA do terminal continua aberta: matamos o claude, não o shell.
+  // Mesmo gate anti-RCE do /inject: pid tem que ser sessão registrada COM start-time batendo (senão
+  // um pid reciclado viraria "mate qualquer processo do meu usuário"). Sessão já morta: só desregistra.
+  if (parts[0] === "sessions" && parts[1] === "cli" && parts.length === 3 && req.method === "DELETE") {
+    const pid = Number(parts[2]);
+    let meta; try { meta = JSON.parse(readFileSync(`${CLI_SESS_DIR}/${pid}.json`, "utf8")); } catch { meta = null; }
+    if (!meta?.pid) { res.writeHead(404, JSONH); return res.end(`{"error":"sessão CLI desconhecida"}`); }
+    const vivo = !!validCliPid(pid);
+    let killed = false;
+    if (vivo) {
+      try { process.kill(pid, "SIGTERM"); killed = true; } catch {}
+      await new Promise(r => setTimeout(r, 1500));
+      if (pidAlive(pid) && startMatches(pid, meta.startedAt)) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    }
+    try { unlinkSync(`${CLI_SESS_DIR}/${pid}.json`); } catch {}
+    delete cliNames[cliNameKey(meta)]; saveCliNames();
+    audit({ act: "cli_kill", pid, alive: vivo });
+    log(`cli kill pid ${pid} (vivo=${vivo})`);
+    notifySessions();
+    res.writeHead(200, JSONH); return res.end(JSON.stringify({ ok: true, killed }));
+  }
+
+  // Apelida a sessão do terminal (overlay do bridge — ver CLI_NAMES_FILE). Título vazio = volta ao
+  // nome derivado. Não exige processo vivo: renomear é metadado, não controle (sem gate anti-RCE).
+  if (parts[0] === "sessions" && parts[1] === "cli" && parts.length === 4 && parts[3] === "rename" && req.method === "POST") {
+    const pid = Number(parts[2]);
+    let meta; try { meta = JSON.parse(readFileSync(`${CLI_SESS_DIR}/${pid}.json`, "utf8")); } catch { meta = null; }
+    if (!meta?.pid) { res.writeHead(404, JSONH); return res.end(`{"error":"sessão CLI desconhecida"}`); }
+    let t = ""; try { t = String(JSON.parse((await readBody(req)) || "{}").title || ""); } catch { res.writeHead(400, JSONH); return res.end(`{"error":"json inválido"}`); }
+    t = t.replace(/[\r\n\t]/g, " ").trim().slice(0, 60);
+    const k = cliNameKey(meta);
+    if (t) cliNames[k] = t; else delete cliNames[k];
+    saveCliNames();
+    audit({ act: "cli_rename", pid, title: t });
+    notifySessions();   // o app repuxa a lista (o ping é genérico "mudou")
+    res.writeHead(200, JSONH); return res.end(JSON.stringify({ ok: true, name: t || meta.name || `pid ${pid}` }));
   }
 
   // "Continuar aqui" — adota a sessão do terminal. 409 se o processo dela ainda estiver vivo.
